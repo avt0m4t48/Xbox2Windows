@@ -44,3 +44,4 @@ jobs:
           if ($code -ne 1 -or ($output -join "`n") -notmatch 'word 4: got 0x31415926, expected 0x31415f02') {
             throw 'The omitted-forwarding control did not cause the expected GPU readback mismatch'
           }
+          exit 0
