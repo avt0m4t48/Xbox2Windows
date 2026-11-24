@@ -248,6 +248,13 @@ constexpr UINT command_stride(DrawKind kind)
     return 0;
 }
 
+bool supports_mesh(ID3D12Device* device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
+    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options, sizeof(options))) &&
+        options.MeshShaderTier >= D3D12_MESH_SHADER_TIER_1;
+}
+
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
          DrawKind kind, bool draw_right, Refusal refusal, const char* label)
@@ -422,12 +429,18 @@ int main(int argc, char** argv) try
     } else {
         for (UINT index = 0;; ++index) {
             const HRESULT hr = factory->EnumAdapters1(index, adapter.ReleaseAndGetAddressOf());
-            if (hr == DXGI_ERROR_NOT_FOUND) return 77;
+            if (hr == DXGI_ERROR_NOT_FOUND) {
+                std::puts("indirect graphics capability skip: no compatible physical adapter");
+                return 77;
+            }
             check(hr, "enumerate physical adapters");
             DXGI_ADAPTER_DESC1 desc{};
             check(adapter->GetDesc1(&desc), "get physical adapter description");
-            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-                SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr))) break;
+            const bool basic_render_driver = desc.VendorId == 0x1414 && desc.DeviceId == 0x008c;
+            if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || basic_render_driver) continue;
+            ComPtr<ID3D12Device> probe;
+            if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&probe))) &&
+                (!mesh || supports_mesh(probe.Get()))) break;
         }
     }
     DXGI_ADAPTER_DESC1 desc{};
@@ -440,13 +453,9 @@ int main(int argc, char** argv) try
 
     ComPtr<ID3D12Device> device, guest;
     check(D3D12XboxCreateDevice(adapter.Get(), nullptr, IID_PPV_ARGS(&device)), "create desktop device through d3d12_xs");
-    if (mesh) {
-        D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
-        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options, sizeof(options))) ||
-            options.MeshShaderTier < D3D12_MESH_SHADER_TIER_1) {
-            std::puts("indirect mesh capability skip: mesh shaders unavailable");
-            return 77;
-        }
+    if (mesh && !supports_mesh(device.Get())) {
+        std::puts("indirect mesh capability skip: mesh shaders unavailable");
+        return 77;
     }
     check(SetEnvironmentVariableA("X2W_D3D12_PERMISSIVE", "1") ? S_OK : HRESULT_FROM_WIN32(GetLastError()), "enable guest");
     check(SetEnvironmentVariableA("X2W_D3D12_LIST_NOOP", "1") ? S_OK : HRESULT_FROM_WIN32(GetLastError()), "enable guest list");

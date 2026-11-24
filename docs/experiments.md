@@ -7026,9 +7026,11 @@ left half. Physical adapter coverage for this Draw path is pending.
 
 The same slot 61 accepts one rootless `DISPATCH_MESH` record with three group
 counts. It requires a direct list and a desktop mesh and pixel pipeline using
-an empty root signature and one matching single-sample color target. The mesh
-path uses the record's group counts without binding an input assembler topology
-or an index buffer. Amplification and console shader pipelines are tracked in
+an empty root signature, one matching single-sample color target, a viewport,
+and a scissor. Producers that bypass wrapper state tracking return the argument
+buffer to `COMMON` before slot 61. The mesh path uses the record's group counts
+without binding an input assembler topology or an index buffer. Amplification
+and console shader pipelines are tracked in
 [#1759](https://github.com/R0Y00/Xbox2Windows/issues/1759) and
 [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
 

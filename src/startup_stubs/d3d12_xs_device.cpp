@@ -1612,10 +1612,14 @@ bool desktop_indirect_graphics_shader(const D3D12_SHADER_BYTECODE& code, D3D12_S
     return true;
 }
 
-// Subobjects 23 (reserved) and 24 (amplification) are unsupported.
-constexpr std::size_t stream_sizes[] = {
-    16, 24, 24, 24, 24, 24, 24, 40, 336, 8, 48, 56, 24, 8, 8, 40, 8, 16, 8, 24, 8, 64, 24, 0, 0, 24,
-};
+constexpr std::size_t stream_sizes[23] = {16, 24, 24, 24, 24, 24, 24, 40, 336, 8, 48, 56, 24, 8, 8, 40, 8, 16, 8, 24, 8, 64, 24};
+
+std::size_t desktop_stream_size(UINT type)
+{
+    // Only native pipeline creation accepts a mesh shader subobject.
+    if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) return 24;
+    return type < std::size(stream_sizes) ? stream_sizes[type] : 0;
+}
 
 // Converts a console pipeline stream to desktop form and creates the pipeline. The subobject type
 // numbers and sizes are the desktop ones; only the pointers and formats inside need converting.
@@ -1640,14 +1644,15 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     // First pass: validate the layout and find the wrapped root signature.
     for (std::size_t offset = 0; offset < bytes;) {
         const UINT type = *reinterpret_cast<UINT*>(stream + offset);
-        if (type >= std::size(stream_sizes) || !stream_sizes[type] || stream_sizes[type] > bytes - offset) {
+        const auto size = desktop_stream_size(type);
+        if (!size || size > bytes - offset) {
             ok = false;
             std::snprintf(why, why_size, "unknown or truncated subobject %u at +0x%zx", type, offset);
             break;
         }
         if (type == 0) root = as_wrapper(*reinterpret_cast<void**>(stream + offset + 8));
         if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) mesh = true;
-        offset += stream_sizes[type];
+        offset += size;
     }
     const bool empty_root = root && root->own().kind == root_signature_kind && root->own().root_without_bindings;
     for (std::size_t offset = 0; ok && offset < bytes;) {
@@ -1683,6 +1688,13 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
             const auto* code = reinterpret_cast<const D3D12_SHADER_BYTECODE*>(stream + offset + 8);
             compute = code->pShaderBytecode && code->BytecodeLength;
+        } else if (mesh && type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT) {
+            const auto* output = reinterpret_cast<const D3D12_STREAM_OUTPUT_DESC*>(stream + offset + 8);
+            if (output->NumEntries || output->NumStrides) {
+                std::snprintf(why, why_size, "mesh streams cannot use stream output");
+                ok = false;
+                break;
+            }
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
             input_layout = reinterpret_cast<const D3D12_INPUT_LAYOUT_DESC*>(stream + offset + 8)->NumElements != 0;
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY) {
@@ -1698,7 +1710,7 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC) {
             samples = *reinterpret_cast<const DXGI_SAMPLE_DESC*>(stream + offset + 4);
         }
-        offset += stream_sizes[type];
+        offset += desktop_stream_size(type);
     }
     if (ok && (vertex || pixel || mesh) &&
         ((!vertex && !mesh) || !pixel || compute || input_layout || topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE ||
