@@ -1375,8 +1375,9 @@ class Stage:
 
     # VOPC with sub-dword addressing (tools/disasm_rdna2.py _decode_vopc_sdwa prints it): each source
     # reads its src0_sel/src1_sel field, zero-extended or, under sext(), sign-extended, and the
-    # compare then reads that 32-bit value as its type. Integer compares only (see compare()).
-    def compare_sdwa_sources(self, base, typ, ops, mods):
+    # compare then reads that 32-bit value as its type. A binary32 class compare reads the whole
+    # float in SRC0 and selects an integer field in SRC1 for the mask.
+    def compare_sdwa_sources(self, base, typ, ops, mods, *, float_src0=False):
         fields = {}
         for m in mods:
             key, _, value = m.partition(':')
@@ -1389,11 +1390,24 @@ class Stage:
             if not selection:
                 raise Unsupported('%s SDWA without src%d_sel' % (base, index))
             sext = token.startswith('sext(') and token.endswith(')')
+            if float_src0 and index == 0:
+                if selection != 'DWORD' or sext:
+                    raise Unsupported('%s requires a DWORD float source' % base)
+                sources.append(self.f(token))
+                continue
             if sext:
                 token = token[len('sext('):-1]
             word = sdwa_source(self.u(token), selection, sext)
             sources.append('int(%s)' % word if typ == 'i32' else word)
         return sources
+
+    def check_compare_sdwa_destination(self, base, writes_exec, ops):
+        # v_cmpx_*_sdwa prints just its sources. v_cmp_*_sdwa prints the scalar destination first.
+        if len(ops) != (2 if writes_exec else 3):
+            raise Unsupported('%s with %d operands' % (base, len(ops)))
+        if not writes_exec and ops[0] not in ('vcc', 'vcc_lo', 'exec', 'exec_lo') and not (
+                reg_range(ops[0]) and reg_range(ops[0])[0] == 's'):
+            raise Unsupported('%s into %s' % (base, ops[0]))
 
     def compare(self, base, ops, mods=()):
         # A comparison reads its two operands directly, so a modifier that arrives here is one this
@@ -1403,20 +1417,29 @@ class Stage:
             raise Unsupported('%s with %s' % (base, mods))
         # v_cmp_class_f32 / v_cmpx_class_f32 test the binary32 class of the value in SRC0 against the
         # class-bit mask in SRC1 (the ISA order: the float operand first, the integer mask second).
-        if base in ('v_cmp_class_f32', 'v_cmpx_class_f32'):
+        name = base.removesuffix('_sdwa')
+        if name in ('v_cmp_class_f32', 'v_cmpx_class_f32'):
+            writes_exec = name == 'v_cmpx_class_f32'
+            sdwa = name != base
+            if sdwa:
+                self.check_compare_sdwa_destination(base, writes_exec, ops)
             if len(ops) == 3:
                 dst, value, mask = ops
-            elif base == 'v_cmpx_class_f32' and len(ops) == 2:
-                # The _e32 spelling writes EXEC implicitly and prints no destination.
+            elif writes_exec and len(ops) == 2:
+                # The e32 and SDWA spellings write EXEC implicitly and print no destination.
                 dst, (value, mask) = 'exec', ops
             else:
                 raise Unsupported('%s with %d operands' % (base, len(ops)))
-            cond = '(class32(%s) & %s) != 0u' % (self.f(value), self.u(mask))
+            if sdwa:
+                value, mask = self.compare_sdwa_sources(base, 'u32', [value, mask], mods, float_src0=True)
+            else:
+                value, mask = self.f(value), self.u(mask)
+            cond = '(class32(%s) & %s) != 0u' % (value, mask)
             predicate = '((%s) ? 1u : 0u)' % cond
             # A narrowed EXEC must stay narrowed: intersect with it, as the generic compare path does.
             if not self.exec_known:
                 predicate = '(exec & %s)' % predicate
-            if base == 'v_cmpx_class_f32' or dst in ('exec', 'exec_lo'):
+            if writes_exec or dst in ('exec', 'exec_lo'):
                 self.exec_known = False
                 self.emit('exec = %s;' % predicate)
             elif dst in ('vcc', 'vcc_lo'):
@@ -1440,7 +1463,7 @@ class Stage:
                  'ge': '{0} >= {1}', 'neq': '!({0} == {1})', 'nlt': '!({0} < {1})', 'nle': '!({0} <= {1})', 'ngt': '!({0} > {1})',
                  'nge': '!({0} >= {1})', 'nlg': '!({2} && ({0} < {1} || {0} > {1}))', 'o': '({0} == {0} && {1} == {1})',
                  'u': '({0} != {0} || {1} != {1})', 't': 'true', 'f': 'false'}
-        # Conditions outside the table, v_cmp_class_* among them, stay refused in both forms.
+        # Conditions outside the table or dedicated lowering stay refused in both forms.
         if cond not in table:
             raise Unsupported(base)
         if sdwa and typ == 'f32':
@@ -1448,13 +1471,7 @@ class Stage:
             # stay refused until they are verified too.
             raise Unsupported('%s: f32 SDWA compares are not lowered' % base)
         if sdwa:
-            # v_cmpx_*_sdwa prints its two sources and writes EXEC (gfx10 forbids sdst_en there);
-            # v_cmp_*_sdwa first prints vcc_lo or the SGPR it writes.
-            if len(ops) != (2 if writes_exec else 3):
-                raise Unsupported('%s with %d operands' % (base, len(ops)))
-            if not writes_exec and ops[0] not in ('vcc', 'vcc_lo', 'exec', 'exec_lo') and not (
-                    reg_range(ops[0]) and reg_range(ops[0])[0] == 's'):
-                raise Unsupported('%s into %s' % (base, ops[0]))
+            self.check_compare_sdwa_destination(base, writes_exec, ops)
         if len(ops) == 3:
             dst, a, b = ops
         else:
