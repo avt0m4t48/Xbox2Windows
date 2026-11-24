@@ -1,0 +1,33 @@
+name: Runtime mesh lowering D3D12 verification
+on:
+  push:
+    branches: [verify/runtime-mesh-lowering]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build and run the native D3D12 mesh fixture
+        shell: pwsh
+        run: |
+          Get-ComputerInfo -Property OsName,OsBuildNumber | Format-List
+          .\tools\dev.ps1
+          cmake --preset release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset release --target offscreen_check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $entry = (Select-String -Path out/build/release/CMakeCache.txt -Pattern '^DXC_EXECUTABLE:FILEPATH=(.+)$').Matches[0].Groups[1].Value
+          python -B tests/verify_mesh_dynamic_native.py "$entry" .\out\build\release\offscreen_check.exe warp
+          if ($LASTEXITCODE -eq 77) {
+            Write-Host 'WARP mesh shader capability skip (77)'
+            exit 0
+          }
+          exit $LASTEXITCODE
