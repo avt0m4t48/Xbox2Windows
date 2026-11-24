@@ -20,14 +20,10 @@ jobs:
         run: |
           Get-ComputerInfo -Property OsName,OsBuildNumber | Format-List
           .\tools\dev.ps1
-          cmake --preset release
+          $python = (Get-Command python).Source
+          cmake --preset release "-DINTAKE_PYTHON=$python"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build --preset release --target offscreen_check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $entry = (Select-String -Path out/build/release/CMakeCache.txt -Pattern '^DXC_EXECUTABLE:FILEPATH=(.+)$').Matches[0].Groups[1].Value
-          python -B tests/verify_mesh_dynamic_native.py "$entry" .\out\build\release\offscreen_check.exe warp
-          if ($LASTEXITCODE -eq 77) {
-            Write-Host 'WARP mesh shader capability skip (77)'
-            exit 0
-          }
+          ctest --preset release --no-tests=error -R '^mesh_dynamic_aot_(cpu|draw_warp)$' -V
           exit $LASTEXITCODE
