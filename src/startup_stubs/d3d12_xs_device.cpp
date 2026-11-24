@@ -1585,7 +1585,7 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     D3D12_RT_FORMAT_ARRAY targets{};
     DXGI_FORMAT depth = DXGI_FORMAT_UNKNOWN;
     bool ok = true;
-    // First pass: find the root signature (shader translation needs it).
+    // First pass: validate the layout and find the wrapped root signature.
     for (std::size_t offset = 0; offset < bytes;) {
         const UINT type = *reinterpret_cast<UINT*>(stream + offset);
         if (type >= std::size(stream_sizes) || stream_sizes[type] > bytes - offset) {
@@ -1918,6 +1918,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (index == resource) argument_state |= D3D12_RESOURCE_STATE_INDEX_BUFFER;
         else require_state(self, index, D3D12_RESOURCE_STATE_INDEX_BUFFER);
         list->IASetIndexBuffer(&view);
+        list->SetGraphicsRootSignature(pass.graphics_root);
     }
     require_state(self, resource, argument_state);
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, nullptr, 0);
@@ -3136,7 +3137,7 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     dump_containers("stream", desc->pPipelineStateSubobjectStream, desc->SizeInBytes < 0x1000 ? desc->SizeInBytes : 0x1000);
     static LONG calls;
     if (first_calls(calls, 8))
-        log("x2w-d3d12 Device::slot86(CreatePipelineState?) stream=%p bytes=0x%llx riid=%s -> placeholder",
+        log("x2w-d3d12 Device::slot86(CreatePipelineState?) stream=%p bytes=0x%llx riid=%s",
             desc->pPipelineStateSubobjectStream, static_cast<unsigned long long>(desc->SizeInBytes), text);
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     ID3D12PipelineState* real_pipeline = nullptr;
@@ -3150,8 +3151,11 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     IndexedPipeline indexed;
     if (render_mode()) {
         char why[256] = "";
-        translation = stream_translation(*desc, blend, has_blend, depth_stencil, has_depth_stencil, dsv_format);
-        if (!translation) real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute, indexed);
+        // Recognized desktop stages must reach the native path before the
+        // guest cache creates a pending translation for any DXBC container.
+        real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute, indexed);
+        if (!real_pipeline)
+            translation = stream_translation(*desc, blend, has_blend, depth_stencil, has_depth_stencil, dsv_format);
         static LONG built;
         if (!translation && first_calls(built, 24))
             log("x2w-render stream pipeline -> %s%s", real_pipeline ? "REAL desktop pipeline" : "placeholder: ", real_pipeline ? "" : why);

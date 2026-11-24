@@ -17,14 +17,14 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-          fetch-depth: 2
+          fetch-depth: 3
       - name: Build and run
         shell: pwsh
         env:
           FIXTURE_MODE: ${{ matrix.mode }}
         run: |
           if ($env:FIXTURE_MODE -eq 'upstream-runtime') {
-            git restore --source=HEAD^ -- src/startup_stubs/d3d12_xs_device.cpp
+            git restore --source=df40e4bc -- src/startup_stubs/d3d12_xs_device.cpp
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
           }
           .\tools\dev.ps1
