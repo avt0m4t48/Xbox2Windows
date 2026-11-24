@@ -23,8 +23,8 @@ constexpr auto format = DXGI_FORMAT_R8G8B8A8_UNORM;
 constexpr std::uint32_t black = 0xff000000, red = 0xff0000ff, green = 0xff00ff00;
 constexpr Words initial{0xa5a5a5a5, 0, 0, 0, 0, 0, 0x5a5a5a5a};
 constexpr std::array<std::uint16_t, 10> indices{99, 99, 99, 0, 1, 2, 3, 4, 5, 99};
+constexpr std::array<std::uint32_t, 10> wide_indices{99, 99, 99, 0, 1, 2, 3, 4, 5, 99};
 constexpr UINT argument_offset = sizeof(std::uint32_t);
-constexpr UINT index_offset = 2 * sizeof(std::uint16_t);
 
 constexpr char shader[] = R"(
 RWByteAddressBuffer data : register(u0);
@@ -218,9 +218,12 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
          bool draw_right, Refusal refusal, const char* label)
 {
+    const UINT index_bytes = draw_right ? sizeof(wide_indices) : sizeof(indices);
+    const UINT index_offset = 2 * (draw_right ? sizeof(std::uint32_t) : sizeof(std::uint16_t));
+    const void* index_data = draw_right ? static_cast<const void*>(wide_indices.data()) : indices.data();
     const PlacedBuffer arguments(device, guest, sizeof(initial), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    const PlacedBuffer index_buffer(device, guest, sizeof(indices), D3D12_RESOURCE_FLAG_NONE);
-    const auto upload = make_buffer(device, sizeof(initial) + sizeof(indices), D3D12_HEAP_TYPE_UPLOAD,
+    const PlacedBuffer index_buffer(device, guest, index_bytes, D3D12_RESOURCE_FLAG_NONE);
+    const auto upload = make_buffer(device, sizeof(initial) + index_bytes, D3D12_HEAP_TYPE_UPLOAD,
                                     D3D12_RESOURCE_STATE_GENERIC_READ);
     const auto arg_readback = make_buffer(device, sizeof(initial), D3D12_HEAP_TYPE_READBACK,
                                           D3D12_RESOURCE_STATE_COPY_DEST);
@@ -228,7 +231,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     const D3D12_RANGE untouched{0, 0};
     check(upload->Map(0, &untouched, &memory), "map upload");
     std::memcpy(memory, initial.data(), sizeof(initial));
-    std::memcpy(static_cast<char*>(memory) + sizeof(initial), indices.data(), sizeof(indices));
+    std::memcpy(static_cast<char*>(memory) + sizeof(initial), index_data, index_bytes);
     upload->Unmap(0, nullptr);
 
     const D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, format, {1, 0},
@@ -250,7 +253,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     const auto native_list = native_object<ID3D12GraphicsCommandList>(device, guest, wrapped);
     auto* list = native_list.Get();
     transition(list, index_buffer.native.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-    list->CopyBufferRegion(index_buffer.native.Get(), 0, upload.Get(), sizeof(initial), sizeof(indices));
+    list->CopyBufferRegion(index_buffer.native.Get(), 0, upload.Get(), sizeof(initial), index_bytes);
     transition(list, index_buffer.native.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     transition(list, arguments.native.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyBufferRegion(arguments.native.Get(), 0, upload.Get(), 0, sizeof(initial));
@@ -280,8 +283,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
     const D3D12_RECT scissor{0, 0, width, height};
     const auto address = reinterpret_cast<UINT64>(index_buffer.address);
-    const D3D12_INDEX_BUFFER_VIEW view{address + (refusal == Refusal::invalid_index ? sizeof(indices) : index_offset),
-                                     sizeof(indices) - index_offset, DXGI_FORMAT_R16_UINT};
+    const D3D12_INDEX_BUFFER_VIEW view{address + (refusal == Refusal::invalid_index ? index_bytes : index_offset),
+                                     index_bytes - index_offset, draw_right ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
     slot<Clear>(wrapped, 52)(wrapped, rtv.ptr, clear, 0, nullptr);
     slot<Targets>(wrapped, 50)(wrapped, 1, &rtv, FALSE, nullptr);
     slot<Bind>(wrapped, 25)(wrapped, graphics);

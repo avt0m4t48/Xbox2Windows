@@ -11,13 +11,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [candidate, upstream-runtime]
+        mode: [candidate, upstream-runtime, missing-index-offset]
     name: WARP / ${{ matrix.mode }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-          fetch-depth: 3
+          fetch-depth: 4
       - name: Build and run
         shell: pwsh
         env:
@@ -26,6 +26,13 @@ jobs:
           if ($env:FIXTURE_MODE -eq 'upstream-runtime') {
             git restore --source=df40e4bc -- src/startup_stubs/d3d12_xs_device.cpp
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          if ($env:FIXTURE_MODE -eq 'missing-index-offset') {
+            $path = 'src/startup_stubs/d3d12_xs_device.cpp'
+            $text = Get-Content -LiteralPath $path -Raw
+            $original = 'view.BufferLocation = native_base + index_offset;'
+            if (!$text.Contains($original)) { throw 'Index offset hook missing' }
+            [IO.File]::WriteAllText((Resolve-Path $path), $text.Replace($original, 'view.BufferLocation = native_base;'))
           }
           .\tools\dev.ps1
           cmake --preset release
@@ -40,6 +47,6 @@ jobs:
           $code = $LASTEXITCODE
           $output | ForEach-Object { Write-Output $_ }
           if ($code -ne 1 -or ($output -join "`n") -notmatch 'left writer: pixel \(0,0\): got 0xff000000, expected 0xff0000ff') {
-            throw 'The unmodified runtime did not cause the expected indexed-draw pixel mismatch'
+            throw 'The changed runtime did not cause the expected indexed-draw pixel mismatch'
           }
           exit 0

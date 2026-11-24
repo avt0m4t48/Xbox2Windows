@@ -1552,7 +1552,8 @@ bool desktop_indexed_shader(const D3D12_SHADER_BYTECODE& code, D3D12_SHADER_VERS
     x2w_startup::ComPtr<ID3D12ShaderReflection> shader;
     if (FAILED(D3DReflect(code.pShaderBytecode, code.BytecodeLength, IID_PPV_ARGS(shader.GetAddressOf())))) return false;
     D3D12_SHADER_DESC desc{};
-    if (FAILED(shader->GetDesc(&desc)) || desc.Version >> 16 != stage || desc.BoundResources) return false;
+    if (FAILED(shader->GetDesc(&desc)) || desc.Version >> 16 != stage ||
+        ((desc.Version >> 4) & 0xf) != 5 || desc.BoundResources) return false;
     if (stage == D3D12_SHVER_VERTEX_SHADER) {
         for (UINT i = 0; i < desc.InputParameters; ++i) {
             D3D12_SIGNATURE_PARAMETER_DESC input{};
@@ -1584,6 +1585,7 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
     D3D12_RT_FORMAT_ARRAY targets{};
     DXGI_FORMAT depth = DXGI_FORMAT_UNKNOWN;
+    DXGI_SAMPLE_DESC samples{1, 0};
     bool ok = true;
     // First pass: validate the layout and find the wrapped root signature.
     for (std::size_t offset = 0; offset < bytes;) {
@@ -1630,13 +1632,16 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
             auto* format = reinterpret_cast<DXGI_FORMAT*>(stream + offset + 4);
             *format = desktop_format(*format);
             depth = *format;
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC) {
+            samples = *reinterpret_cast<const DXGI_SAMPLE_DESC*>(stream + offset + 4);
         }
         offset += stream_sizes[type];
     }
     if (ok && (vertex || pixel) &&
         (!vertex || !pixel || compute || input_layout || topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE ||
-         targets.NumRenderTargets != 1 || targets.RTFormats[0] == DXGI_FORMAT_UNKNOWN || depth != DXGI_FORMAT_UNKNOWN)) {
-        std::snprintf(why, why_size, "desktop indexed stream needs VS/PS, triangles, one render target and no vertex layout or depth target");
+         targets.NumRenderTargets != 1 || targets.RTFormats[0] == DXGI_FORMAT_UNKNOWN || depth != DXGI_FORMAT_UNKNOWN ||
+         samples.Count != 1 || samples.Quality)) {
+        std::snprintf(why, why_size, "desktop indexed stream needs VS/PS, triangles, one single-sample target and no vertex layout or depth");
         ok = false;
     }
     ID3D12PipelineState* pipeline = nullptr;
@@ -1831,9 +1836,12 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
 {
     Wrapper* w = as_wrapper(pipeline);
     Pass& pass = pass_of(self);
-    pass.pipeline_real = w && w->own().kind == pipeline_kind && w->own().real;
+    const bool available = w && w->own().kind == pipeline_kind && w->own().real;
+    pass.indexed_pipeline = available ? w->own().indexed_pipeline : IndexedPipeline{};
+    // Keep direct draws on their existing translation path. Slot 61 binds
+    // a recognized desktop indexed pipeline just before it records the draw.
+    pass.pipeline_real = available && !pass.indexed_pipeline.root;
     pass.compute_pipeline = pass.pipeline_real && w->own().compute_pipeline;
-    pass.indexed_pipeline = pass.pipeline_real ? w->own().indexed_pipeline : IndexedPipeline{};
     pass.pipeline = w && w->own().kind == pipeline_kind ? w : nullptr;
     InterlockedIncrement(pass.pipeline_real ? &render_pipelines_real : &render_pipelines_missing);
     if (auto* list = recording(self); list && pass.pipeline_real) list->SetPipelineState(static_cast<ID3D12PipelineState*>(w->own().real));
@@ -1875,10 +1883,14 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || !pass.indexed_pipeline.root ||
             pass.indexed_pipeline.root != pass.graphics_root)
             return refuse("indexed draw requires a direct list with a matching desktop graphics pipeline and root");
-        if (!pass.targets_bound || pass.target_count != 1 || pass.target_formats[0] != pass.indexed_pipeline.target_format ||
+        if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
+            pass.target_formats[0] != pass.indexed_pipeline.target_format ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set ||
             pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
             return refuse("indexed draw requires one matching target, viewport, scissor and triangle-list topology");
+        const auto samples = pass.target0->GetDesc().SampleDesc;
+        if (samples.Count != 1 || samples.Quality)
+            return refuse("indexed draw requires a single-sample render target");
     } else if (!pass.compute_pipeline || !pass.compute_root) {
         return refuse("requires a desktop compute pipeline and root");
     }
@@ -1918,6 +1930,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (index == resource) argument_state |= D3D12_RESOURCE_STATE_INDEX_BUFFER;
         else require_state(self, index, D3D12_RESOURCE_STATE_INDEX_BUFFER);
         list->IASetIndexBuffer(&view);
+        list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
         list->SetGraphicsRootSignature(pass.graphics_root);
     }
     require_state(self, resource, argument_state);
@@ -3154,10 +3167,10 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
         // Recognized desktop stages must reach the native path before the
         // guest cache creates a pending translation for any DXBC container.
         real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute, indexed);
-        if (!real_pipeline)
+        if (!real_pipeline || indexed.root)
             translation = stream_translation(*desc, blend, has_blend, depth_stencil, has_depth_stencil, dsv_format);
         static LONG built;
-        if (!translation && first_calls(built, 24))
+        if ((real_pipeline || !translation) && first_calls(built, 24))
             log("x2w-render stream pipeline -> %s%s", real_pipeline ? "REAL desktop pipeline" : "placeholder: ", real_pipeline ? "" : why);
     }
     *out = wrap(real_pipeline, pipeline_kind);
