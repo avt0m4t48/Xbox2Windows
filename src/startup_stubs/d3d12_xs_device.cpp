@@ -83,8 +83,8 @@ const char* const kind_names[kind_count] = {
 // state lives in front of the object, out of the title's reach, and the zero-filled area behind the
 // vtable pointer is sized per kind (64 KiB for command lists).
 struct Wrapper;
-enum class IndirectCommand { none, dispatch, draw_indexed };
-struct IndexedPipeline {
+enum class IndirectCommand { none, dispatch, draw, draw_indexed };
+struct IndirectGraphicsPipeline {
     ID3D12RootSignature* root{};
     DXGI_FORMAT target_format{};
 };
@@ -109,7 +109,7 @@ struct alignas(16) WrapperOwn {
     Wrapper* list_device;    // CommandList: wrapper that created this list.
     Wrapper* signature_device; // CommandSignature: owner of the supported single-command shape
     IndirectCommand indirect_command;
-    IndexedPipeline indexed_pipeline;
+    IndirectGraphicsPipeline indirect_graphics;
     UINT list_node_mask;
 };
 static_assert(sizeof(WrapperOwn) % 16 == 0, "the title-visible object must stay 16-byte aligned");
@@ -919,6 +919,8 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
             const auto type = desc->pArgumentDescs[0].Type;
             if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH && desc->ByteStride == sizeof(D3D12_DISPATCH_ARGUMENTS))
                 state.indirect_command = IndirectCommand::dispatch;
+            if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW && desc->ByteStride == sizeof(D3D12_DRAW_ARGUMENTS))
+                state.indirect_command = IndirectCommand::draw;
             if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED && desc->ByteStride == sizeof(D3D12_DRAW_INDEXED_ARGUMENTS))
                 state.indirect_command = IndirectCommand::draw_indexed;
             if (state.indirect_command != IndirectCommand::none) state.signature_device = self;
@@ -1581,7 +1583,7 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
     return S_OK;
 }
 
-bool desktop_indexed_shader(const D3D12_SHADER_BYTECODE& code, D3D12_SHADER_VERSION_TYPE stage)
+bool desktop_indirect_graphics_shader(const D3D12_SHADER_BYTECODE& code, D3D12_SHADER_VERSION_TYPE stage)
 {
     if (code.BytecodeLength < 32 || code.BytecodeLength > (1u << 20) ||
         !x2w_local::readable(code.pShaderBytecode, code.BytecodeLength) ||
@@ -1607,7 +1609,7 @@ constexpr std::size_t stream_sizes[23] = {16, 24, 24, 24, 24, 24, 24, 40, 336, 8
 // Converts a console pipeline stream to desktop form and creates the pipeline. The subobject type
 // numbers and sizes are the desktop ones; only the pointers and formats inside need converting.
 ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, char* why, std::size_t why_size,
-                                          bool& compute, IndexedPipeline& indexed)
+                                          bool& compute, IndirectGraphicsPipeline& graphics)
 {
     const std::size_t bytes = desc->SizeInBytes;
     if (bytes < 16 || bytes > 0x2000 || (bytes & 7) || !x2w_local::readable(desc->pPipelineStateSubobjectStream, bytes)) {
@@ -1646,7 +1648,7 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
                 const bool is_vertex = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
                 if (type > D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS || !root || root->own().kind != root_signature_kind ||
                     !root->own().root_without_bindings ||
-                    !desktop_indexed_shader(*code, is_vertex ? D3D12_SHVER_VERTEX_SHADER : D3D12_SHVER_PIXEL_SHADER)) {
+                    !desktop_indirect_graphics_shader(*code, is_vertex ? D3D12_SHVER_VERTEX_SHADER : D3D12_SHVER_PIXEL_SHADER)) {
                     std::snprintf(why, why_size, "stage %u has no translation or supported desktop binding", type);
                     ok = false;
                     break;
@@ -1678,7 +1680,7 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
         (!vertex || !pixel || compute || input_layout || topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE ||
          targets.NumRenderTargets != 1 || targets.RTFormats[0] == DXGI_FORMAT_UNKNOWN || depth != DXGI_FORMAT_UNKNOWN ||
          samples.Count != 1 || samples.Quality)) {
-        std::snprintf(why, why_size, "desktop indexed stream needs VS/PS, triangles, one single-sample target and no vertex layout or depth");
+        std::snprintf(why, why_size, "desktop indirect graphics stream needs VS/PS, triangles, one single-sample target and no vertex layout or depth");
         ok = false;
     }
     ID3D12PipelineState* pipeline = nullptr;
@@ -1701,7 +1703,7 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
         check_device("Device CreatePipelineState", 86);
     }
     if (pipeline && vertex && pixel)
-        indexed = {static_cast<ID3D12RootSignature*>(root->own().real), targets.RTFormats[0]};
+        graphics = {static_cast<ID3D12RootSignature*>(root->own().real), targets.RTFormats[0]};
     return pipeline;
 }
 
@@ -1770,7 +1772,7 @@ struct Pass {
     bool pipeline_real = false;      // the bound pipeline has a desktop pipeline
     bool compute_pipeline = false;
     bool compute_root = false;
-    IndexedPipeline indexed_pipeline;
+    IndirectGraphicsPipeline indirect_graphics;
     ID3D12RootSignature* graphics_root = nullptr;
     bool targets_bound = false;
     bool topology_ok = false;
@@ -1874,10 +1876,10 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
     Wrapper* w = as_wrapper(pipeline);
     Pass& pass = pass_of(self);
     const bool available = w && w->own().kind == pipeline_kind && w->own().real;
-    pass.indexed_pipeline = available ? w->own().indexed_pipeline : IndexedPipeline{};
+    pass.indirect_graphics = available ? w->own().indirect_graphics : IndirectGraphicsPipeline{};
     // Keep direct draws on their existing translation path. Slot 61 binds
-    // a recognized desktop indexed pipeline just before it records the draw.
-    pass.pipeline_real = available && !pass.indexed_pipeline.root;
+    // a recognized desktop graphics pipeline just before it records the draw.
+    pass.pipeline_real = available && !pass.indirect_graphics.root;
     pass.compute_pipeline = pass.pipeline_real && w->own().compute_pipeline;
     pass.pipeline = w && w->own().kind == pipeline_kind ? w : nullptr;
     InterlockedIncrement(pass.pipeline_real ? &render_pipelines_real : &render_pipelines_missing);
@@ -1913,28 +1915,31 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         return refuse("missing or placeholder signature");
     const Wrapper* device = self->own().list_device;
     if (!device || sig->own().signature_device != device)
-        return refuse("requires a single rootless Dispatch or DrawIndexed signature from this device");
-    const bool indexed = sig->own().indirect_command == IndirectCommand::draw_indexed;
+        return refuse("requires a single rootless Dispatch, Draw or DrawIndexed signature from this device");
+    const auto command = sig->own().indirect_command;
+    const bool indexed = command == IndirectCommand::draw_indexed;
+    const bool graphics = indexed || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
-    if (indexed) {
-        if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || !pass.indexed_pipeline.root ||
-            pass.indexed_pipeline.root != pass.graphics_root)
-            return refuse("indexed draw requires a direct list with a matching desktop graphics pipeline and root");
+    u64 bytes = sizeof(D3D12_DISPATCH_ARGUMENTS);
+    if (graphics) {
+        bytes = indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) : sizeof(D3D12_DRAW_ARGUMENTS);
+        if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || !pass.indirect_graphics.root ||
+            pass.indirect_graphics.root != pass.graphics_root)
+            return refuse("draw requires a direct list with a matching desktop graphics pipeline and root");
         if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
-            pass.target_formats[0] != pass.indexed_pipeline.target_format ||
+            pass.target_formats[0] != pass.indirect_graphics.target_format ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set ||
             pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
-            return refuse("indexed draw requires one matching target, viewport, scissor and triangle-list topology");
+            return refuse("draw requires one matching target, viewport, scissor and triangle-list topology");
         const auto samples = pass.target0->GetDesc().SampleDesc;
         if (samples.Count != 1 || samples.Quality)
-            return refuse("indexed draw requires a single-sample render target");
+            return refuse("draw requires a single-sample render target");
     } else if (!pass.compute_pipeline || !pass.compute_root) {
         return refuse("requires a desktop compute pipeline and root");
     }
     Wrapper* buffer = as_wrapper(argument);
     if (!buffer || buffer->own().kind != resource_kind || !buffer->own().real)
         return refuse("argument has no desktop resource");
-    const u64 bytes = indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) : sizeof(D3D12_DISPATCH_ARGUMENTS);
     const auto base = reinterpret_cast<u64>(buffer->own().title_memory);
     if (!base || (offset & 3) || offset > ~u64{} - base)
         return refuse("invalid argument offset or unmapped buffer");
@@ -1967,6 +1972,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (index == resource) argument_state |= D3D12_RESOURCE_STATE_INDEX_BUFFER;
         else require_state(self, index, D3D12_RESOURCE_STATE_INDEX_BUFFER);
         list->IASetIndexBuffer(&view);
+    }
+    if (graphics) {
         list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
         list->SetGraphicsRootSignature(pass.graphics_root);
     }
@@ -3198,13 +3205,13 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     bool has_depth_stencil = false;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     bool compute = false;
-    IndexedPipeline indexed;
+    IndirectGraphicsPipeline graphics;
     if (render_mode()) {
         char why[256] = "";
         // Recognized desktop stages must reach the native path before the
         // guest cache creates a pending translation for any DXBC container.
-        real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute, indexed);
-        if (!real_pipeline || indexed.root)
+        real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute, graphics);
+        if (!real_pipeline || graphics.root)
             translation = stream_translation(*desc, blend, has_blend, depth_stencil, has_depth_stencil, dsv_format);
         static LONG built;
         if ((real_pipeline || !translation) && first_calls(built, 24))
@@ -3212,7 +3219,7 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     }
     *out = wrap(real_pipeline, pipeline_kind);
     static_cast<Wrapper*>(*out)->own().compute_pipeline = real_pipeline && compute;
-    static_cast<Wrapper*>(*out)->own().indexed_pipeline = indexed;
+    static_cast<Wrapper*>(*out)->own().indirect_graphics = graphics;
     note_pipeline(static_cast<Wrapper*>(*out), 86, nullptr, desc->pPipelineStateSubobjectStream, desc->SizeInBytes < 0x2000 ? desc->SizeInBytes : 0x2000,
                   translation, translation && has_blend ? &blend : nullptr,
                   translation && has_depth_stencil ? &depth_stencil : nullptr,
