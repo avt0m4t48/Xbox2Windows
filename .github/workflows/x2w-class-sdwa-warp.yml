@@ -1,0 +1,38 @@
+name: Startup binary32 class SDWA verification
+on:
+  push:
+    branches: [verify/startup-class-f32-sdwa]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run FXC and DXC readbacks on WARP
+        shell: pwsh
+        run: |
+          .\tools\dev.ps1
+          $python = (Get-Command python).Source
+          cmake --preset release "-DINTAKE_PYTHON=$python"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset release --target offscreen_check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $output = & ctest --preset release --no-tests=error -R '^startup_gfx2hlsl_vopc_sdwa_warp$' -V
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          $log = $output -join "`n"
+          foreach ($compiler in ('fxc', 'dxc')) {
+            if ($log -notmatch "$compiler warp: class compare matches all 256 pixels: ok" -or
+                $log -notmatch "$compiler warp: class compare without the select fails: ok" -or
+                $log -notmatch "$compiler warp: class mutation matches the whole-dword image: ok") {
+              throw "Missing $compiler class compare or control results"
+            }
+          }
+          exit $code
