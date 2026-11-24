@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-      - name: Build and check the upstream baseline
+      - name: Build and run all three indirect fixtures
         shell: pwsh
         run: |
           Get-ComputerInfo -Property OsName,OsBuildNumber | Format-List
@@ -21,12 +21,5 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build --preset release --target startup_indirect_draw_indexed startup_indirect_dispatch
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ctest --preset release --no-tests=error -R '^startup_indirect_(dispatch|draw_indexed)_warp$' -V
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $output = & .\out\build\release\startup_indirect_draw_indexed.exe warp draw 2>&1
-          $code = $LASTEXITCODE
-          $output | ForEach-Object { Write-Output $_ }
-          if ($code -ne 1 -or ($output -join "`n") -notmatch 'one triangle: pixel \(0,0\): got 0xff000000, expected 0xff0000ff') {
-            throw 'The upstream runtime did not produce the expected Draw pixel mismatch'
-          }
-          exit 0
+          ctest --preset release --no-tests=error -R '^startup_indirect_(dispatch|draw(_indexed)?)_warp$' -V
+          exit $LASTEXITCODE
