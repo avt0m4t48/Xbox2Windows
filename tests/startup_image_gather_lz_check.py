@@ -109,7 +109,8 @@ def draw(dxc, renderer, adapter):
                 source = source.replace('U(t.x)', 'U(t.w)', 1)
             hlsl.write_text(source, encoding='ascii')
             subprocess.run([dxc, '-WX', '-T', 'ps_6_0', '-E', 'main', '-Fo', dxil, hlsl], check=True)
-            write_case(case, mips, first, [expected_taps(first, component, uv)] * SIDE**2)
+            # The renderer uploads fixture level zero at the first resident mip.
+            write_case(case, mips, first, [expected_taps(0, component, uv)] * SIDE**2)
             proc = subprocess.run([renderer, adapter, '--check-pixel-gather', dxil, case],
                                   capture_output=True, text=True)
             output = proc.stdout + proc.stderr
