@@ -1,0 +1,46 @@
+name: Indirect dispatch verification
+on:
+  push:
+    branches: [verify/startup-indirect-dispatch]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [candidate, omitted-forwarding]
+    name: WARP / ${{ matrix.mode }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Build and run
+        shell: pwsh
+        env:
+          FIXTURE_MODE: ${{ matrix.mode }}
+        run: |
+          if ($env:FIXTURE_MODE -eq 'omitted-forwarding') {
+            $path = 'src/startup_stubs/d3d12_xs_device.cpp'
+            $text = Get-Content -LiteralPath $path -Raw
+            $line = '        list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);'
+            if (!$text.Contains($line)) { throw 'Expected forwarding hook missing' }
+            [IO.File]::WriteAllText((Resolve-Path $path), $text.Replace($line, ''))
+          }
+          .\tools\dev.ps1
+          cmake --preset release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset release --target startup_indirect_dispatch startup_command_list_slot_names
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ($env:FIXTURE_MODE -eq 'candidate') {
+            ctest --preset release --no-tests=error -R '^startup_(indirect_dispatch_warp|command_list_slot_names)$' -V
+            exit $LASTEXITCODE
+          }
+          $output = & .\out\build\release\startup_indirect_dispatch.exe warp 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($code -ne 1 -or ($output -join "`n") -notmatch 'word 4: got 0x31415926, expected 0x31415f02') {
+            throw 'The omitted-forwarding control did not cause the expected GPU readback mismatch'
+          }
