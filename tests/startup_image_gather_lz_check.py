@@ -103,6 +103,8 @@ def draw(dxc, renderer, adapter):
 
         def run(mips, first, component, uv, code, *, mutant=False):
             source = pipeline(code).hlsl_ps()
+            # The offscreen vertex shader places TEXCOORD0 before SV_Position.
+            source = source.replace('struct PSIn {', 'struct PSIn {\n    float4 uv : TEXCOORD0;', 1)
             if mutant:
                 source = source.replace('U(t.x)', 'U(t.w)', 1)
             hlsl.write_text(source, encoding='ascii')
