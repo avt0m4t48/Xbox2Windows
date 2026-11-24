@@ -160,6 +160,7 @@ jobs:
             tests/dxil_retarget_check.py \
             tests/rdna2_tools_check.py \
             tests/mesh_dynamic_geometry_check.py \
+            tests/mesh_dynamic_aot_check.py \
             tests/pso_readiness_check.py \
             tests/xmem_attribute_scan_check.py \
             tests/xgameruntime_table_check.py \
