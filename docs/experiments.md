@@ -6832,29 +6832,32 @@ rules. The command list, shader and buffers are source-built desktop fixtures.
 
 #### GPU-written indirect dispatch arguments
 
-[`startup_indirect_dispatch.cpp`](../tests/startup_indirect_dispatch.cpp) uses the
-desktop device path through `D3D12XboxCreateDevice`. A source-built compute
-shader writes a `(4, 3, 2)` dispatch record after a guard word in a default-heap
-buffer. The command list transitions that buffer from `UNORDERED_ACCESS` to
-`INDIRECT_ARGUMENT`, then executes one dispatch at byte offset 4. The consumer
-adds a value derived from each group ID into a separate UAV. The fence-ordered
-readback checks the three argument words, both guards and the accumulated value
-against a CPU reference. With the writer omitted, the input is `(0, 3, 2)` and
-the output remains at its sentinel value.
+[`startup_indirect_dispatch.cpp`](../tests/startup_indirect_dispatch.cpp) creates
+a guest list and places the argument buffer through device slot 133. A
+source-built compute shader writes a dispatch record at byte offset 4 on the
+underlying desktop list. On that same list, guest slot 61 resolves the
+resource and offset, transitions the buffer to `INDIRECT_ARGUMENT` and executes
+one Dispatch. The fenced readback compares the accumulated result and both
+guards with a CPU reference for `(4, 3, 2)`, `(2, 3, 2)` and an omitted
+producer. Negative controls supply an unmapped argument, a short range and a
+placeholder signature. The fixture binds the result UAV through the desktop
+list and uses the guest compute root and pipeline slots for the consumer.
 
 ```powershell
 cmake --build --preset dev --target startup_indirect_dispatch
 ctest --preset dev --no-tests=error -R '^startup_indirect_dispatch_(warp|hardware)$' -V
 ```
 
-On Windows 11 build 26300.9711 with the debug layer unavailable, WARP (Microsoft
+The desktop-only baseline in [#1805](https://github.com/R0Y00/Xbox2Windows/pull/1805)
+ran on Windows 11 build 26300.9711 with the debug layer unavailable. WARP (Microsoft
 Basic Render Driver, 10.0.26100.9711) and an NVIDIA GeForce RTX 4070
 (32.0.16.2114) both read back `0x31415f02` with the writer and `0x31415926` with
 the writer omitted. Both cases passed. The hardware case returns 77 if there is
-no physical D3D12 adapter. The fixture covers the desktop dispatch signature
-for the producer and consumer in [#1412](https://github.com/R0Y00/Xbox2Windows/issues/1412).
-Forwarding console command lists and aliasing console argument buffers remain
-separate implementation work.
+no physical D3D12 adapter. The guest path covers one rootless desktop Dispatch
+signature with no count buffer and a slot-133 buffer tracked from `COMMON`.
+Full compute binding, additional signature forms and title execution remain
+tracked in [#1759](https://github.com/R0Y00/Xbox2Windows/issues/1759) and
+[#1412](https://github.com/R0Y00/Xbox2Windows/issues/1412).
 
 #### D3D12.X graphics command list (XCL-12)
 

@@ -14,9 +14,8 @@
 //   which desktop slot is which is not known.
 // - Slots 32 to 59 are the desktop slots 28 to 55 plus four. Implemented and checked against the
 //   desktop order: 32, 34, 36, 40, 42, 44, 47, 48, 50 and 52.
-// - Slot 139 is Reset, as implemented in d3d12_xs_device.cpp.
-// - Everything else, including every slot from 60 up (the console list has methods of its own
-//   there), has no name. A name there would be a guess.
+// - Slots 61 (ExecuteIndirect) and 139 (Reset) are implemented in d3d12_xs_device.cpp.
+// - Other slots have no confirmed meaning.
 #pragma once
 
 #include <cstddef>
@@ -44,6 +43,7 @@ static_assert(desktop_method_count == 51, "ID3D12GraphicsCommandList has 51 meth
 inline constexpr int console_shift = 4;  // console slot = desktop slot + 4, from SetDescriptorHeaps on
 inline constexpr int first_shifted_slot = 32;
 inline constexpr int last_shifted_slot = 59;
+inline constexpr int execute_indirect_slot = 61;
 inline constexpr int reset_slot = 139;
 
 // The name of a command list slot, or nullptr when it is not known.
@@ -55,6 +55,7 @@ inline const char* name(int slot) noexcept
     if (slot >= 0 && slot < first_desktop_method) return iunknown[slot];
     if (slot == first_desktop_method || (slot >= 12 && slot <= 25)) return desktop(slot);
     if (slot >= first_shifted_slot && slot <= last_shifted_slot) return desktop(slot - console_shift);
+    if (slot == execute_indirect_slot) return "ExecuteIndirect";
     if (slot == reset_slot) return "Reset";
     return nullptr;
 }

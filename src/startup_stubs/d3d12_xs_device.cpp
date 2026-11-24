@@ -94,9 +94,11 @@ struct alignas(16) WrapperOwn {
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
+    bool compute_pipeline;   // PipelineState: a desktop compute pipeline
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
     Wrapper* list_device;    // CommandList: wrapper that created this list.
+    Wrapper* dispatch_signature_device;   // CommandSignature: owner of the supported single-Dispatch shape
     UINT list_node_mask;
 };
 static_assert(sizeof(WrapperOwn) % 16 == 0, "the title-visible object must stay 16-byte aligned");
@@ -899,6 +901,13 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
                                               u64 iid, u64 out)
 {
     const u64 result = create_slot<device_kind, 41, 2>(self, reinterpret_cast<u64>(desc), root, iid, out, 0, 0, 0, 0);
+    if (SUCCEEDED(static_cast<HRESULT>(result)) && out && desc && !root &&
+        desc->ByteStride == sizeof(D3D12_DISPATCH_ARGUMENTS) && desc->NumArgumentDescs == 1 &&
+        desc->pArgumentDescs[0].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
+        auto* signature = *reinterpret_cast<Wrapper**>(out);
+        if (signature && signature->own().kind == command_signature_kind)
+            signature->own().dispatch_signature_device = self;
+    }
     static LONG failures;
     if (FAILED(static_cast<HRESULT>(result)) && desc && first_calls(failures, 8)) {
         log("x2w-d3d12   CreateCommandSignature failed: stride=%u args=%u node=0x%x root=0x%llx", desc->ByteStride,
@@ -910,7 +919,7 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
         }
     }
     // Argument types outside the desktop enumeration (0x69 seen, stride 12) cannot be created on
-    // desktop; the title gets a placeholder CommandSignature (command lists are not executed).
+    // desktop; the title gets a placeholder CommandSignature.
     bool console_type = false;
     for (UINT i = 0; desc && i < desc->NumArgumentDescs; ++i)
         console_type |= static_cast<UINT>(desc->pArgumentDescs[i].Type) > D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
@@ -1530,7 +1539,8 @@ constexpr std::size_t stream_sizes[23] = {16, 24, 24, 24, 24, 24, 24, 40, 336, 8
 
 // Converts a console pipeline stream to desktop form and creates the pipeline. The subobject type
 // numbers and sizes are the desktop ones; only the pointers and formats inside need converting.
-ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, char* why, std::size_t why_size)
+ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, char* why, std::size_t why_size,
+                                          bool& compute)
 {
     const std::size_t bytes = desc->SizeInBytes;
     if (bytes < 16 || bytes > 0x2000 || (bytes & 7) || !x2w_local::readable(desc->pPipelineStateSubobjectStream, bytes)) {
@@ -1573,6 +1583,9 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
                 code->pShaderBytecode = blob->GetBufferPointer();
                 code->BytecodeLength = blob->GetBufferSize();
             }
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
+            const auto* code = reinterpret_cast<const D3D12_SHADER_BYTECODE*>(stream + offset + 8);
+            compute = code->pShaderBytecode && code->BytecodeLength;
         } else if (type == 15) {
             auto* formats = reinterpret_cast<DXGI_FORMAT*>(stream + offset + 4);
             for (int i = 0; i < 8; ++i) formats[i] = desktop_format(formats[i]);
@@ -1668,6 +1681,8 @@ std::size_t readable_window(u64 address, std::size_t wanted)
 // Per-list state while recording.
 struct Pass {
     bool pipeline_real = false;      // the bound pipeline has a desktop pipeline
+    bool compute_pipeline = false;
+    bool compute_root = false;
     bool targets_bound = false;
     bool topology_ok = false;
     unsigned srv_bound = 0;          // bit per root parameter with a desktop address bound
@@ -1770,9 +1785,59 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
     Wrapper* w = as_wrapper(pipeline);
     Pass& pass = pass_of(self);
     pass.pipeline_real = w && w->own().kind == pipeline_kind && w->own().real;
+    pass.compute_pipeline = pass.pipeline_real && w->own().compute_pipeline;
     pass.pipeline = w && w->own().kind == pipeline_kind ? w : nullptr;
     InterlockedIncrement(pass.pipeline_real ? &render_pipelines_real : &render_pipelines_missing);
     if (auto* list = recording(self); list && pass.pipeline_real) list->SetPipelineState(static_cast<ID3D12PipelineState*>(w->own().real));
+}
+// List slot 33 (desktop 29 + 4), SetComputeRootSignature.
+void __stdcall list_compute_root(Wrapper* self, void* root)
+{
+    auto* list = recording(self);
+    if (!list) return;
+    Wrapper* w = as_wrapper(root);
+    Pass& pass = pass_of(self);
+    pass.compute_root = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
+    if (pass.compute_root) list->SetComputeRootSignature(static_cast<ID3D12RootSignature*>(w->own().real));
+}
+
+// The guest method has independent resource and byte-offset arguments.
+void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
+                                     void* count_buffer, u64 count_offset)
+{
+    const auto refuse = [](const char* reason) {
+        static LONG refusals;
+        if (first_calls(refusals, 16)) log("x2w-render ExecuteIndirect refused: %s", reason);
+    };
+    auto* list = recording(self);
+    if (!list) return refuse("list is closed");
+    const auto type = list->GetType();
+    if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
+        return refuse("requires a direct or compute command list");
+    if (count != 1 || count_buffer || count_offset) return refuse("requires one command and no count buffer");
+    Wrapper* sig = as_wrapper(signature);
+    if (!sig || sig->own().kind != command_signature_kind || !sig->own().real)
+        return refuse("missing or placeholder signature");
+    const Wrapper* device = self->own().list_device;
+    if (!device || sig->own().dispatch_signature_device != device)
+        return refuse("requires a single rootless Dispatch signature from this device");
+    Pass& pass = pass_of(self);
+    if (!pass.compute_pipeline || !pass.compute_root) return refuse("requires a desktop compute pipeline and root");
+    Wrapper* buffer = as_wrapper(argument);
+    if (!buffer || buffer->own().kind != resource_kind || !buffer->own().real)
+        return refuse("argument has no desktop resource");
+    constexpr u64 bytes = sizeof(D3D12_DISPATCH_ARGUMENTS);
+    const auto base = reinterpret_cast<u64>(buffer->own().title_memory);
+    if (!base || (offset & 3) || offset > ~u64{} - base)
+        return refuse("invalid argument offset or unmapped buffer");
+    const auto found = placed_buffer_range(device, base + offset, bytes);
+    if (found.reject || found.owner != buffer) return refuse("argument record is outside a unique placed buffer");
+    const auto* info = resource_info(buffer);
+    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+        return refuse("argument buffer does not use COMMON state tracking");
+    auto* resource = static_cast<ID3D12Resource*>(buffer->own().real);
+    require_state(self, resource, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, nullptr, 0);
 }
 // List slot 34 (desktop 30 + 4), SetGraphicsRootSignature. The title's parameters are tracked for translated
 // draws either way. A root signature that indexes a descriptor heap directly is not set on the desktop list: the
@@ -2996,15 +3061,17 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     D3D12_DEPTH_STENCIL_DESC depth_stencil{};
     bool has_depth_stencil = false;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
+    bool compute = false;
     if (render_mode()) {
         char why[256] = "";
         translation = stream_translation(*desc, blend, has_blend, depth_stencil, has_depth_stencil, dsv_format);
-        if (!translation) real_pipeline = build_stream_pipeline(desc, why, sizeof(why));
+        if (!translation) real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute);
         static LONG built;
         if (!translation && first_calls(built, 24))
             log("x2w-render stream pipeline -> %s%s", real_pipeline ? "REAL desktop pipeline" : "placeholder: ", real_pipeline ? "" : why);
     }
     *out = wrap(real_pipeline, pipeline_kind);
+    static_cast<Wrapper*>(*out)->own().compute_pipeline = real_pipeline && compute;
     note_pipeline(static_cast<Wrapper*>(*out), 86, nullptr, desc->pPipelineStateSubobjectStream, desc->SizeInBytes < 0x2000 ? desc->SizeInBytes : 0x2000,
                   translation, translation && has_blend ? &blend : nullptr,
                   translation && has_depth_stencil ? &depth_stencil : nullptr,
@@ -3437,6 +3504,7 @@ void build_tables()
         list_typed[24] = reinterpret_cast<ListTyped>(&list_stencil_ref);
         list_typed[25] = reinterpret_cast<ListTyped>(&list_pipeline);
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
+        list_typed[33] = reinterpret_cast<ListTyped>(&list_compute_root);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
         list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
         list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
@@ -3446,6 +3514,7 @@ void build_tables()
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
+        list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
     }
     tables[device_kind][16] = reinterpret_cast<void*>(&device_create_root_signature);
 

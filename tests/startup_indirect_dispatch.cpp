@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -17,7 +18,7 @@ extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*,
 namespace {
 using Microsoft::WRL::ComPtr;
 using Words = std::array<std::uint32_t, 6>;
-constexpr Words initial{0xa5a5a5a5, 0, 3, 2, 0x31415926, 0x5a5a5a5a};
+constexpr Words initial{0xa5a5a5a5, 0, 0, 0, 0x31415926, 0x5a5a5a5a};
 constexpr UINT argument_offset = sizeof(std::uint32_t);
 constexpr UINT argument_bytes = 4 * sizeof(std::uint32_t);
 constexpr UINT result_bytes = 2 * sizeof(std::uint32_t);
@@ -30,19 +31,28 @@ RWByteAddressBuffer data : register(u0);
 void write_args() { data.Store3(4, uint3(4, 3, 2)); }
 
 [numthreads(1, 1, 1)]
+void write_fewer_args() { data.Store3(4, uint3(2, 3, 2)); }
+
+[numthreads(1, 1, 1)]
 void consume_args(uint3 group : SV_GroupID) {
     uint previous;
     data.InterlockedAdd(0, 1 + group.x + 10 * group.y + 100 * group.z, previous);
 }
 )";
 
-ComPtr<ID3D12PipelineState> pipeline(ID3D12Device* device, ID3D12RootSignature* root, const char* entry)
+ComPtr<ID3DBlob> compile(const char* entry)
 {
     ComPtr<ID3DBlob> code, errors;
     const HRESULT hr = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr, entry, "cs_5_0",
                                   0, 0, &code, &errors);
     if (FAILED(hr) && errors) std::fprintf(stderr, "%s\n", static_cast<const char*>(errors->GetBufferPointer()));
     check(hr, entry);
+    return code;
+}
+
+ComPtr<ID3D12PipelineState> pipeline(ID3D12Device* device, ID3D12RootSignature* root, const char* entry)
+{
+    const auto code = compile(entry);
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = root;
     desc.CS = {code->GetBufferPointer(), code->GetBufferSize()};
@@ -51,13 +61,70 @@ ComPtr<ID3D12PipelineState> pipeline(ID3D12Device* device, ID3D12RootSignature* 
     return result;
 }
 
-bool run(ID3D12Device* device, ID3D12RootSignature* root, ID3D12PipelineState* writer,
-         ID3D12PipelineState* consumer, ID3D12CommandSignature* signature, bool write_args)
+template <typename Method>
+Method slot(IUnknown* object, unsigned index)
+{
+    return reinterpret_cast<Method>((*reinterpret_cast<void***>(object))[index]);
+}
+
+template <typename T>
+ComPtr<T> native_object(ID3D12Device* device, ID3D12Device* guest, IUnknown* object)
+{
+    // SetPrivateDataInterface unwraps a guest argument before the call reaches the shared desktop device.
+    constexpr GUID key{0x10a62244, 0x1615, 0x4953, {0xa2, 0x52, 0xbe, 0x42, 0x35, 0x27, 0xa0, 0x61}};
+    check(guest->SetPrivateDataInterface(key, object), "publish underlying object");
+    ComPtr<IUnknown> stored;
+    UINT bytes = sizeof(IUnknown*);
+    const HRESULT read = device->GetPrivateData(key, &bytes, stored.GetAddressOf());
+    check(guest->SetPrivateDataInterface(key, nullptr), "clear underlying object");
+    check(read, "retrieve underlying object");
+    ComPtr<T> result;
+    check(stored.As(&result), "query underlying object");
+    return result;
+}
+
+ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root)
+{
+    const auto code = compile("consume_args");
+    const struct {
+        alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE root_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+        ID3D12RootSignature* root;
+        alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE cs_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
+        D3D12_SHADER_BYTECODE code;
+    } stream{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root,
+             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, {code->GetBufferPointer(), code->GetBufferSize()}};
+    const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+    using Create = HRESULT (WINAPI*)(IUnknown*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+    ComPtr<IUnknown> result;
+    check(slot<Create>(guest, 86)(guest, &desc, __uuidof(ID3D12PipelineState),
+                                 reinterpret_cast<void**>(result.GetAddressOf())), "create guest compute pipeline");
+    return result;
+}
+
+enum class Rejection { none, unmapped, short_range, placeholder };
+
+bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, ID3D12RootSignature* guest_root,
+         ID3D12PipelineState* writer, IUnknown* consumer, ID3D12CommandSignature* signature,
+         unsigned groups, Rejection rejection)
 {
     auto upload = make_buffer(device, sizeof(initial), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     auto readback = make_buffer(device, sizeof(initial), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    auto arguments = make_buffer(device, argument_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
-                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const auto free_memory = [](void* memory) { VirtualFree(memory, 0, MEM_RELEASE); };
+    const std::unique_ptr<void, decltype(free_memory)> memory_backing(
+        VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), free_memory);
+    if (!memory_backing) throw std::bad_alloc();
+    D3D12_RESOURCE_DESC argument_desc{};
+    argument_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    argument_desc.Width = argument_bytes;
+    argument_desc.Height = argument_desc.DepthOrArraySize = argument_desc.MipLevels = argument_desc.SampleDesc.Count = 1;
+    argument_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    argument_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    using Place = HRESULT (WINAPI*)(IUnknown*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID, void**);
+    ComPtr<IUnknown> guest_arguments;
+    check(slot<Place>(guest, 133)(guest, static_cast<char*>(memory_backing.get()) + 4, &argument_desc,
+                                  D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource),
+                                  reinterpret_cast<void**>(guest_arguments.GetAddressOf())), "place guest argument buffer");
+    const auto arguments = native_object<ID3D12Resource>(device, guest, guest_arguments.Get());
     auto result = make_buffer(device, result_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     void* memory = nullptr;
@@ -66,30 +133,56 @@ bool run(ID3D12Device* device, ID3D12RootSignature* root, ID3D12PipelineState* w
     std::memcpy(memory, initial.data(), sizeof(initial));
     upload->Unmap(0, nullptr);
 
-    ComputeCommands commands(device, nullptr);
-    auto* list = commands.list.Get();
+    ComPtr<ID3D12CommandAllocator> allocator;
+    check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "create guest allocator");
+    using CreateList = HRESULT (WINAPI*)(IUnknown*, const void*, IUnknown*, IUnknown*, REFIID, void**);
+    const UINT list_desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+    ComPtr<IUnknown> guest_list;
+    check(slot<CreateList>(guest, 73)(guest, list_desc, allocator.Get(), nullptr, __uuidof(ID3D12GraphicsCommandList),
+                                     reinterpret_cast<void**>(guest_list.GetAddressOf())), "create guest command list");
+    using Reset = HRESULT (WINAPI*)(IUnknown*, IUnknown*, void*, void*);
+    check(slot<Reset>(guest_list.Get(), 139)(guest_list.Get(), allocator.Get(), nullptr, nullptr), "reset guest command list");
+    const auto native_list = native_object<ID3D12GraphicsCommandList>(device, guest, guest_list.Get());
+    auto* list = native_list.Get();
+    transition(list, arguments.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyBufferRegion(arguments.Get(), 0, upload.Get(), 0, argument_bytes);
     list->CopyBufferRegion(result.Get(), 0, upload.Get(), argument_bytes, result_bytes);
     transition(list, result.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list->SetComputeRootSignature(root);
     auto argument_state = D3D12_RESOURCE_STATE_COPY_DEST;
-    if (write_args) {
+    if (writer) {
         transition(list, arguments.Get(), argument_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         argument_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         list->SetPipelineState(writer);
         list->SetComputeRootUnorderedAccessView(0, arguments->GetGPUVirtualAddress());
         list->Dispatch(1, 1, 1);
     }
-    // The transition orders the UAV writes before the command processor reads the record.
-    transition(list, arguments.Get(), argument_state, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-    list->SetPipelineState(consumer);
-    list->SetComputeRootUnorderedAccessView(0, result->GetGPUVirtualAddress());
-    list->ExecuteIndirect(signature, 1, arguments.Get(), argument_offset, nullptr, 0);
-    transition(list, arguments.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transition(list, result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transition(list, arguments.Get(), argument_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(readback.Get(), 0, arguments.Get(), 0, argument_bytes);
+    transition(list, arguments.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+
+    using Bind = void (WINAPI*)(IUnknown*, IUnknown*);
+    slot<Bind>(guest_list.Get(), 25)(guest_list.Get(), consumer);
+    slot<Bind>(guest_list.Get(), 33)(guest_list.Get(), guest_root);
+    list->SetComputeRootUnorderedAccessView(0, result->GetGPUVirtualAddress());
+    using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
+    auto* argument = rejection == Rejection::unmapped ? nullptr : guest_arguments.Get();
+    const UINT64 offset = rejection == Rejection::short_range ? argument_bytes : argument_offset;
+    slot<Execute>(guest_list.Get(), 61)(guest_list.Get(), signature, 1, argument, offset, nullptr, 0);
+    transition(list, result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(readback.Get(), argument_bytes, result.Get(), 0, result_bytes);
-    commands.submit_and_wait(device);
+    using Close = HRESULT (WINAPI*)(IUnknown*);
+    check(slot<Close>(guest_list.Get(), 9)(guest_list.Get()), "close guest command list");
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12Fence> fence;
+    check(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)), "create queue");
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "create completion fence");
+    ID3D12CommandList* submitted[]{list};
+    queue->ExecuteCommandLists(1, submitted);
+    check(queue->Signal(fence.Get(), 1), "signal completion fence");
+    check(fence->SetEventOnCompletion(1, nullptr), "wait for completion");
+    check(device->GetDeviceRemovedReason(), "GPU completion");
 
     const D3D12_RANGE read{0, sizeof(initial)};
     check(readback->Map(0, &read, &memory), "map readback");
@@ -97,15 +190,20 @@ bool run(ID3D12Device* device, ID3D12RootSignature* root, ID3D12PipelineState* w
     std::memcpy(observed.data(), memory, sizeof(observed));
     readback->Unmap(0, &untouched);
     Words expected = initial;
-    if (write_args) {
-        expected[1] = 4;
+    if (writer) {
+        expected[1] = groups;
+        expected[2] = 3;
+        expected[3] = 2;
+    }
+    if (rejection == Rejection::none) {
         for (std::uint32_t z = 0; z < expected[3]; ++z)
             for (std::uint32_t y = 0; y < expected[2]; ++y)
                 for (std::uint32_t x = 0; x < expected[1]; ++x)
                     expected[4] += 1 + x + 10 * y + 100 * z;
     }
     std::printf("%s: args=(%u,%u,%u), result=0x%08x (expected 0x%08x)\n",
-                write_args ? "GPU writer" : "omitted writer", observed[1], observed[2], observed[3],
+                rejection == Rejection::none ? (writer ? "GPU writer" : "omitted writer") : "refused call",
+                observed[1], observed[2], observed[3],
                 observed[4], expected[4]);
     for (std::size_t i = 0; i < expected.size(); ++i) {
         if (observed[i] == expected[i]) continue;
@@ -139,6 +237,12 @@ int main(int argc, char** argv) try
         if (!adapter) return 77;
     }
     check(D3D12XboxCreateDevice(adapter.Get(), nullptr, IID_PPV_ARGS(&device)), "create desktop device through d3d12_xs");
+    SetEnvironmentVariableA("X2W_D3D12_PERMISSIVE", "1");
+    SetEnvironmentVariableA("X2W_D3D12_LIST_NOOP", "1");
+    SetEnvironmentVariableA("X2W_D3D12_RENDER", "1");
+    const std::array<unsigned char, 64> parameters{};
+    ComPtr<ID3D12Device> guest;
+    check(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), IID_PPV_ARGS(&guest)), "create guest device");
     DXGI_ADAPTER_DESC1 adapter_desc{};
     check(adapter->GetDesc1(&adapter_desc), "get adapter description");
     std::printf("adapter: %ls, debug layer %s\n", adapter_desc.Description, debug ? "enabled" : "unavailable");
@@ -153,18 +257,38 @@ int main(int argc, char** argv) try
     const D3D12_ROOT_SIGNATURE_DESC desc{1, &uav, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> serialized;
     ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12RootSignature> guest_root;
     D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
     const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &argument, 0};
     ComPtr<ID3D12CommandSignature> signature;
+    ComPtr<ID3D12CommandSignature> placeholder;
     ComPtr<ID3D12InfoQueue> info;
     if (debug) check(device.As(&info), "get debug message queue");
     check(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr), "serialize root");
     check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&root)), "create root");
-    check(device->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create command signature");
+    check(guest->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&guest_root)),
+          "create guest root");
+    check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create guest command signature");
+    // The desktop validation error during creation is expected. The guest call itself must be clean.
+    if (info) check(info->PushDenyAllStorageFilter(), "mute expected signature creation diagnostic");
+    argument.Type = static_cast<D3D12_INDIRECT_ARGUMENT_TYPE>(0x69);
+    const HRESULT placeholder_hr = guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&placeholder));
+    if (info) info->PopStorageFilter();
+    check(placeholder_hr, "create placeholder command signature");
     const auto writer = pipeline(device.Get(), root.Get(), "write_args");
-    const auto consumer = pipeline(device.Get(), root.Get(), "consume_args");
-    if (!run(device.Get(), root.Get(), writer.Get(), consumer.Get(), signature.Get(), true) ||
-        !run(device.Get(), root.Get(), writer.Get(), consumer.Get(), signature.Get(), false)) return 1;
+    const auto smaller_writer = pipeline(device.Get(), root.Get(), "write_fewer_args");
+    const auto consumer = guest_pipeline(guest.Get(), guest_root.Get());
+    const auto verify = [&](ID3D12PipelineState* producer, unsigned groups, Rejection rejection,
+                            ID3D12CommandSignature* command_signature) {
+        return run(device.Get(), guest.Get(), root.Get(), guest_root.Get(), producer, consumer.Get(),
+                   command_signature, groups, rejection);
+    };
+    if (!verify(writer.Get(), 4, Rejection::none, signature.Get()) ||
+        !verify(smaller_writer.Get(), 2, Rejection::none, signature.Get()) ||
+        !verify(nullptr, 0, Rejection::none, signature.Get()) ||
+        !verify(writer.Get(), 4, Rejection::unmapped, signature.Get()) ||
+        !verify(writer.Get(), 4, Rejection::short_range, signature.Get()) ||
+        !verify(writer.Get(), 4, Rejection::placeholder, placeholder.Get())) return 1;
     if (info) {
         for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
             SIZE_T bytes = 0;
