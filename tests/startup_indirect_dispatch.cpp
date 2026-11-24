@@ -86,7 +86,7 @@ ComPtr<T> native_object(ID3D12Device* device, ID3D12Device* guest, IUnknown* obj
 ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root)
 {
     const auto code = compile("consume_args");
-    const struct {
+    struct {
         alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE root_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
         ID3D12RootSignature* root;
         alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE cs_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
@@ -270,7 +270,11 @@ int main(int argc, char** argv) try
           "create guest root");
     check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create guest command signature");
     // The desktop validation error during creation is expected. The guest call itself must be clean.
-    if (info) check(info->PushDenyAllStorageFilter(), "mute expected signature creation diagnostic");
+    D3D12_MESSAGE_SEVERITY signature_error = D3D12_MESSAGE_SEVERITY_ERROR;
+    D3D12_INFO_QUEUE_FILTER signature_filter{};
+    signature_filter.DenyList.NumSeverities = 1;
+    signature_filter.DenyList.pSeverityList = &signature_error;
+    if (info) check(info->PushStorageFilter(&signature_filter), "mute expected signature creation diagnostic");
     argument.Type = static_cast<D3D12_INDIRECT_ARGUMENT_TYPE>(0x69);
     const HRESULT placeholder_hr = guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&placeholder));
     if (info) info->PopStorageFilter();
