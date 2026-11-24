@@ -1,0 +1,57 @@
+name: Startup fixed-mip gather verification
+on:
+  push:
+    branches: [verify/startup-gather-lz]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check the encoded shader and D3D12 readback
+        shell: pwsh
+        run: |
+          .\tools\dev.ps1
+          $python = (Get-Command python).Source
+          cmake --preset release "-DINTAKE_PYTHON=$python"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset release --target offscreen_check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $output = & ctest --preset release --no-tests=error -R '^startup_image_gather_lz(_warp)?$' -V
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($code -ne 0 -or ([regex]::Matches(($output -join "`n"), 'pixels=64 channels=256 max_absolute_error=0').Count -ne 9)) {
+            throw 'The WARP run did not complete the nine expected draw cases'
+          }
+      - name: Compile the startup requests with FXC
+        shell: pwsh
+        run: |
+          .\tools\dev.ps1
+          @'
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, 'tests')
+          from startup_image_gather_lz_check import CHANNELS, G, VS_WORDS, root_blob, shader
+
+          target = Path('out/gather-fxc')
+          target.mkdir(parents=True, exist_ok=True)
+          root = root_blob(flags=0)
+          assert G.find_fxc(), 'Could not find FXC'
+          for index, channel in enumerate(CHANNELS):
+              pixel = shader(1 << index)
+              key = G.pipeline_key(VS_WORDS, pixel, root)
+              for extension, blob in (('.a', VS_WORDS), ('.b', pixel), ('.root', root)):
+                  (target / f'req_{key:016x}{extension}').write_bytes(blob)
+              result = G.translate_request(target, key)
+              assert result == 'ok', (channel, result)
+              assert (target / f'{key:016x}.ps.cso').read_bytes()[:4] == b'DXBC'
+              print(f'{channel} startup request compiled to ps_5_1 and published')
+          '@ | python -B -
+          exit $LASTEXITCODE
